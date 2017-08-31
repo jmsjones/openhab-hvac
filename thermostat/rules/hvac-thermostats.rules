@@ -1,0 +1,299 @@
+import java.util.*
+
+val baseFrameworkGroupName = "HVAC_Framework_Thermostat_"
+var List<String> points = newArrayList(
+    "ActiveMode", "ConstantFan",
+    "CoolCall", "Cooling", "CoolSP", "CoolSupplied",
+    "CurrentTemp", "Deadband", "EnableRemoteMode",
+    "HeatCall", "Heating", "HeatSP", "HeatSupplied",
+    "RemoteModeRequest", "Status", "System"
+    )
+
+val control_RespondWithinDeadband = false
+
+val sim_ActiveModifier = 0.3
+val sim_RandomModifier = 0.5
+var sim_Direction = 1
+val sim_Min = 10
+val sim_Max = 100
+
+val checkPoint = [
+    StringBuilder messageBuilder,
+    Map<String, GenericItem> itemMap,
+    String point,
+    boolean checkDecimal |
+    if (messageBuilder.length() == 0) {
+        if (!itemMap.containsKey(point)) {
+            messageBuilder.append(point)
+            messageBuilder.append(" missing")
+        } else if ((checkDecimal) && (!(itemMap.get(point).state instanceof DecimalType))) {
+            messageBuilder.append(point)
+            messageBuilder.append(" invalid")
+        }
+    }
+    true
+]
+
+val sendCommandIfDifferent = [
+    GenericItem item,
+    Object command |
+    if ((item != null) && (command != null) && (item.state != command)) {
+        sendCommand(item, command.toString())
+    }
+    true
+]
+
+rule "HVAC_Thermostats_Control"
+when
+    Time cron "0/5 * * * * ?"
+then
+    HVAC_Framework_Thermostat_Thermostat.members.forEach[thermostatGroup |
+        if (!(thermostatGroup instanceof GroupItem)) {
+            return
+        }
+
+        var Map<String, GenericItem> itemMap = new HashMap<String, GenericItem>()
+        var List<GenericItem> availableModeItems = newArrayList()
+        var activeModeText = ""
+        var errorMessage = ""
+        var StringBuilder errorMessageBuilder = new StringBuilder()
+        var statusMessage = ""
+        var systemText = ""
+        var canHeat = false
+        var canCool = false
+        var heatCall = false
+        var coolCall = false
+        var heating = false
+        var cooling = false
+
+        /* ======================================
+            Find items
+        */
+        (thermostatGroup as GroupItem).members.forEach[thermostatChildItem |
+            for (String groupName: thermostatChildItem.getGroupNames()) {
+                for (String point: points) {
+                    if (groupName == (baseFrameworkGroupName + point)) {
+                        itemMap.put(point, (thermostatChildItem as GenericItem))
+                    }
+                }
+                if (groupName == (baseFrameworkGroupName + "AvailableMode")) {
+                    availableModeItems.add(thermostatChildItem)
+                }
+            }
+        ]
+
+        /* ======================================
+            Validate core items
+        */
+        checkPoint.apply(errorMessageBuilder, itemMap, "ActiveMode", false)
+        checkPoint.apply(errorMessageBuilder, itemMap, "CurrentTemp", true)
+        checkPoint.apply(errorMessageBuilder, itemMap, "System", false)
+
+        /* ======================================
+            Mode handling
+        */
+        if ((errorMessageBuilder.length() == 0) && (itemMap.get("EnableRemoteMode") != null)) {
+            if (itemMap.get("EnableRemoteMode").state == ON) {
+                checkPoint.apply(errorMessageBuilder, itemMap, "RemoteModeRequest", false)
+                if (errorMessageBuilder.length() == 0) {
+                    var remoteModeText = ""
+                    var remoteModeLocked = false
+                    if (itemMap.get("RemoteModeRequest").state instanceof StringType) {
+                        for (String modeRequestPart: itemMap.get("RemoteModeRequest").state.toString().split(";")) {
+                            var modeRequestSubParts = modeRequestPart.split("=")
+                            if (modeRequestSubParts.length == 2) {
+                                if (modeRequestSubParts.get(0).trim() == "Name") {
+                                    remoteModeText = modeRequestSubParts.get(1)
+                                }
+                                if ((modeRequestSubParts.get(0).trim() == "Locked") && (modeRequestSubParts.get(1) == "true")) {
+                                    remoteModeLocked = true
+                                }
+                            }
+                        }
+                    }
+                    if (remoteModeText != "") {
+                        sendCommandIfDifferent.apply(itemMap.get("ActiveMode"), remoteModeText)
+                        if (!remoteModeLocked) {
+                            sendCommand(itemMap.get("RemoteModeRequest"), "")
+                        }
+                    }
+                }
+            }
+        }
+
+        if (errorMessageBuilder.length() == 0) {
+            activeModeText = itemMap.get("ActiveMode").state.toString()
+            if (activeModeText != "Manual") {
+                var modeFound = false
+                for (GenericItem availableModeItem: availableModeItems) {
+                    var String[] labelParts = availableModeItem.label.toString().split(";")
+                    if (labelParts.get(0) == activeModeText) {
+                        modeFound = true
+                        var String[] stateParts = availableModeItem.state.toString().split(";")
+                        for (String statePart: stateParts) {
+                            var String[] stateSubParts = statePart.split("=")
+                            if (stateSubParts.length == 2) {
+                                sendCommandIfDifferent.apply(itemMap.get(stateSubParts.get(0).trim()), stateSubParts.get(1).trim())
+                            }
+                        }
+                    }
+                }
+                if (!modeFound) {
+                    errorMessageBuilder.append("ActiveMode invalid")
+                }
+            }
+        }
+
+        /* ======================================
+            Core logic
+        */
+        if (errorMessageBuilder.length() == 0) {
+            systemText = itemMap.get("System").state.toString()
+            switch systemText {
+                case "Off": {
+                }
+                case "Heat": {
+                    canHeat = true
+                }
+                case "Cool": {
+                    canCool = true
+                }
+                case "Auto": {
+                    canHeat = true
+                    canCool = true
+                }
+                default: {
+                    errorMessageBuilder.append("System invalid")
+                }
+            }
+        }
+
+        if ((errorMessageBuilder.length() == 0) && ((canHeat) || (canCool))) {
+            checkPoint.apply(errorMessageBuilder, itemMap, "Deadband", true)
+        }
+
+        if ((errorMessageBuilder.length() == 0) && (canHeat)) {
+            checkPoint.apply(errorMessageBuilder, itemMap, "HeatCall", false)
+            checkPoint.apply(errorMessageBuilder, itemMap, "HeatSupplied", false)
+            checkPoint.apply(errorMessageBuilder, itemMap, "Heating", false)
+            checkPoint.apply(errorMessageBuilder, itemMap, "HeatSP", true)
+        }
+
+        if ((errorMessageBuilder.length() == 0) && (canCool)) {
+            checkPoint.apply(errorMessageBuilder, itemMap, "CoolCall", false)
+            checkPoint.apply(errorMessageBuilder, itemMap, "CoolSupplied", false)
+            checkPoint.apply(errorMessageBuilder, itemMap, "Cooling", false)
+            checkPoint.apply(errorMessageBuilder, itemMap, "CoolSP", true)
+        }
+
+        if ((errorMessageBuilder.length() == 0) && (systemText != "Off")) {
+            val currentTemp = (itemMap.get("CurrentTemp").state as DecimalType).doubleValue()
+            val deadband = (itemMap.get("Deadband").state as DecimalType).doubleValue()
+            var heatSP = 0.0
+            var coolSP = 0.0
+            if (canHeat) {
+                heatSP = (itemMap.get("HeatSP").state as DecimalType).doubleValue()
+            }
+            if (canCool) {
+                coolSP = (itemMap.get("CoolSP").state as DecimalType).doubleValue()
+            }
+            if ((canHeat) && (canCool)) {
+                if ((coolSP - heatSP) < (deadband * 3)) {
+                    errorMessageBuilder.append("Setpoint/deadband configuration invalid")
+                }
+            }
+            if (errorMessageBuilder.length() == 0) {
+                if (canHeat) {
+                    if (currentTemp < heatSP) {
+                        heatCall = true
+                    } else if (currentTemp < (heatSP + deadband)) {
+                        if (itemMap.get("Heating").state == ON) {
+                            heatCall = true
+                        } else if ((control_RespondWithinDeadband) && (itemMap.get("HeatSupplied").state == ON)) {
+                            heatCall = true
+                        }
+                    }
+                }
+                if ((!heatCall) && (canCool)) {
+                    if (currentTemp > coolSP) {
+                        coolCall = true
+                    } else if (currentTemp > (coolSP - deadband)) {
+                        if (itemMap.get("Cooling").state == ON) {
+                            coolCall = true
+                        } else if ((control_RespondWithinDeadband) && (itemMap.get("CoolSupplied").state == ON)) {
+                            coolCall = true
+                        }
+                    }
+                }
+                if ((heatCall) && (itemMap.get("HeatSupplied").state == ON)) {
+                    heating = true
+                } else if ((coolCall) && (itemMap.get("CoolSupplied").state == ON)) {
+                    cooling = true
+                }
+            }
+        }
+
+        sendCommandIfDifferent.apply(itemMap.get("HeatCall"), (if (heatCall) ON else OFF))
+        sendCommandIfDifferent.apply(itemMap.get("CoolCall"), (if (coolCall) ON else OFF))
+        sendCommandIfDifferent.apply(itemMap.get("Heating"), (if (heating) ON else OFF))
+        sendCommandIfDifferent.apply(itemMap.get("Cooling"), (if (cooling) ON else OFF))
+
+        if (errorMessageBuilder.length() > 0) {
+            statusMessage = "Error: " + errorMessageBuilder.toString()
+        }
+        sendCommandIfDifferent.apply(itemMap.get("Status"), statusMessage)
+
+        /* ======================================
+            Sim logic
+        */
+        if (itemMap.containsKey("CurrentTemp")) {
+            var runSim = false
+            for (String groupName: thermostatGroup.getGroupNames()) {
+                if (groupName == (baseFrameworkGroupName + "SimThermostat")) {
+                    runSim = true
+                }
+            }
+            if (runSim) {
+                var currentTemp = 0.0
+                if (itemMap.get("CurrentTemp").state instanceof DecimalType) {
+                    currentTemp = (itemMap.get("CurrentTemp").state as DecimalType).doubleValue()
+                }
+                var rnd = new java.util.Random()
+                var offset = (rnd.nextInt(100) / 100.0) * sim_Direction * sim_RandomModifier
+                if (heating) {
+                    offset += sim_ActiveModifier
+                }
+                if (cooling) {
+                    offset -= sim_ActiveModifier
+                }
+                var newTemp = currentTemp + offset
+                if (newTemp < sim_Min) {
+                    newTemp = sim_Min
+                } else if (newTemp > sim_Max) {
+                    newTemp = sim_Max
+                }
+                sendCommand(itemMap.get("CurrentTemp"), newTemp)
+                if (rnd.nextInt(100) < 5) {
+                    sim_Direction *= -1
+                }
+            }
+        }
+    ]
+end
+
+rule "HVAC_Thermostats_Modes"
+when
+    Time cron "3/5 * * * * ?"
+then
+    HVAC_Framework_Thermostat_AvailableMode.members.forEach[availableModeItem |
+        if (!(availableModeItem instanceof StringItem)) {
+            return
+        }
+        if (availableModeItem.label.contains(";")) {
+            var modeSettings = availableModeItem.label.split(";", 2).get(1)
+            if (availableModeItem.state != modeSettings) {
+                sendCommand(availableModeItem, modeSettings)
+            }
+        }
+    ]
+end
